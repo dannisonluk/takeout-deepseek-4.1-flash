@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+node_modules.old/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Next.js — .next/ is not covered by dist/|build/, and a failed build can leave
+# a .next.prev/ behind. Both are regenerable and both are large (89M / 68M).
+.next/
+.next.prev/
+out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Prisma
+prisma/migrations/dev.db*
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Vitest leaves a timestamped copy of vite.config.ts / vitest.config.ts behind
+# when it is interrupted mid-run. Regenerable, and it clutters `git status`.
+*.timestamp-*.mjs
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local scratch
+.tmp/
+.tmp-e2e/
+
+# Local Postgres data directory (npm run infra:up alternative; `postgres -D .pgdata`).
+# This is a live database, never a build artifact — ignore it, do not delete it.
+.pgdata/
+*.pid
+
+# Agent working memory — project notes, not source. Kept on disk, out of the repo.
+.workbuddy-ai/

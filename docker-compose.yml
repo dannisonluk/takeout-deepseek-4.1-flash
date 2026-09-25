@@ -1,0 +1,43 @@
+services:
+  postgres:
+    # PostGIS is required for `merchants.location geography(Point,4326)` and the
+    # phase-2 rider geo queries.
+    image: postgis/postgis:16-3.4
+    container_name: takeout-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: takeout
+      POSTGRES_PASSWORD: takeout
+      POSTGRES_DB: takeout
+      # Deterministic collation for the pg_trgm search index.
+      POSTGRES_INITDB_ARGS: '--locale=C --encoding=UTF8'
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U takeout -d takeout']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: takeout-redis
+    restart: unless-stopped
+    # Cache + idempotency keys + outbox pub/sub. Append-only keeps idempotency
+    # keys across a restart, which is what stops a replay from double-charging.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:

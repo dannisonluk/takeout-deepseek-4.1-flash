@@ -1,0 +1,47 @@
+{
+  "name": "takeout-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "外賣自取平台 — Food Delivery & Self-Pickup Platform (MVP: self-pickup, phase 2: fleet delivery)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @takeout/domain && npm run build -w @takeout/api && npm run build -w @takeout/web",
+    "test": "npm run test -w @takeout/domain",
+    "test:watch": "npm run test:watch -w @takeout/domain",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev": "npm run start:dev -w @takeout/api",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:seed": "node prisma/seed.js",
+    "db:studio": "prisma studio",
+    "db:post-init": "psql \"$DATABASE_URL\" -f prisma/sql/post-init.sql",
+    "e2e": "node scripts/e2e-smoke.js",
+    "e2e:admin": "node scripts/e2e-admin.js",
+    "e2e:pay-at-store": "node scripts/e2e-pay-at-store.js",
+    "e2e:payments": "node scripts/e2e-payments.js",
+    "e2e:feedback": "node scripts/e2e-feedback.js",
+    "e2e:timeouts": "node scripts/e2e-timeouts.js",
+    "e2e:metrics": "node scripts/e2e-metrics.js",
+    "e2e:reservation": "node scripts/e2e-reservation.js",
+    "e2e:closure": "node scripts/e2e-closure.js",
+    "e2e:refund": "node scripts/e2e-refund.js",
+    "e2e:waitlist": "node scripts/e2e-waitlist.js",
+    "e2e:dining": "node scripts/e2e-dining.js",
+    "e2e:analytics": "node scripts/e2e-analytics.js",
+    "e2e:all": "npm run e2e && npm run e2e:admin && npm run e2e:pay-at-store && npm run e2e:reservation && npm run e2e:closure && npm run e2e:refund && npm run e2e:waitlist && npm run e2e:dining && npm run e2e:analytics",
+    "check:pricing": "node scripts/check-pricing-config.js",
+    "check:contract": "node scripts/contract-check.js",
+    "check:all": "npm run check:pricing && npm run check:contract",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

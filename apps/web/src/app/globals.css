@@ -1,0 +1,1117 @@
+/* ==========================================================================
+   Design system
+   ==========================================================================
+   Hand-written rather than Tailwind, on purpose:
+
+   * One fewer native toolchain (Tailwind v4 ships an oxide binary) in a build
+     that already has to survive a sandboxed npm install.
+   * Every colour, radius and space is a named token below, so the customer
+     app, the merchant portal and the admin console cannot drift apart — which
+     is exactly what happens when three people each pick their own utility
+     classes.
+
+   Dark-only, also on purpose: the kitchen board is read in a dim kitchen and
+   the admin console in long sessions. One theme means one set of contrast
+   decisions that is actually right, instead of two that are half-right.
+   ========================================================================== */
+
+:root {
+  /* Surfaces, darkest to lightest. Depth is expressed by lightness, not by
+     shadows — a shadow on a dark background reads as a smudge. */
+  --bg: #0b0f14;
+  --surface-1: #121821;
+  --surface-2: #1a2230;
+  --surface-3: #232d3f;
+  --border: #2a3547;
+  --border-strong: #3a4761;
+
+  /* Text. `--text-dim` is for metadata, never for anything a user must read. */
+  --text: #e8edf5;
+  --text-muted: #9aa7bd;
+  --text-dim: #6b7a93;
+
+  --accent: #ff6b35;
+  --accent-hover: #ff8355;
+  --accent-soft: rgba(255, 107, 53, 0.14);
+
+  --ok: #34d399;
+  --ok-soft: rgba(52, 211, 153, 0.14);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.14);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.14);
+  --info: #60a5fa;
+  --info-soft: rgba(96, 165, 250, 0.14);
+  --neutral-soft: rgba(154, 167, 189, 0.14);
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 16px;
+  --radius-full: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'Noto Sans TC',
+    'PingFang HK', 'Microsoft JhengHei', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --nav-width: 232px;
+  --content-max: 1200px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+h1 {
+  font-size: 24px;
+}
+h2 {
+  font-size: 18px;
+}
+h3 {
+  font-size: 15px;
+}
+h4 {
+  font-size: 13px;
+}
+
+p {
+  margin: 0;
+}
+
+/* ---- layout ------------------------------------------------------------ */
+
+.page {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-5);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.stack-sm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.row-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-4);
+}
+.grid-3 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-4);
+}
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-3);
+}
+
+/* ---- shell ------------------------------------------------------------- */
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.nav {
+  width: var(--nav-width);
+  flex-shrink: 0;
+  background: var(--surface-1);
+  border-right: 1px solid var(--border);
+  padding: var(--space-5) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.02em;
+}
+.nav-brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #12161d;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  padding: 0 var(--space-2) var(--space-2);
+  font-weight: 600;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 7px var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 13px;
+  transition: background 0.12s, color 0.12s;
+}
+.nav-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.nav-item[data-active='true'] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.nav-foot {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(8px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.topbar-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* ---- card / panel ------------------------------------------------------ */
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+}
+.card-tight {
+  padding: var(--space-3);
+}
+.card-flush {
+  padding: 0;
+  overflow: hidden;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.card-hover:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.stat {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.stat-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---- text helpers ------------------------------------------------------ */
+
+.muted {
+  color: var(--text-muted);
+}
+.dim {
+  color: var(--text-dim);
+}
+.tiny {
+  font-size: 12px;
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.strong {
+  font-weight: 650;
+}
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.right {
+  text-align: right;
+}
+.center {
+  text-align: center;
+}
+.nowrap {
+  white-space: nowrap;
+}
+
+/* ---- badge ------------------------------------------------------------- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.badge-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+/* ---- button ------------------------------------------------------------ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--text-dim);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #12161d;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn-danger {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #12161d;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.btn-sm {
+  padding: 4px 9px;
+  font-size: 12px;
+}
+.btn-lg {
+  padding: 11px 20px;
+  font-size: 14px;
+}
+.btn-block {
+  width: 100%;
+}
+
+/* ---- form -------------------------------------------------------------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.input,
+.select,
+.textarea {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  transition: border-color 0.12s;
+}
+.input:focus,
+.select:focus,
+.textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--text-dim);
+}
+.input:disabled,
+.select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.textarea {
+  resize: vertical;
+  min-height: 68px;
+}
+.input-error {
+  border-color: var(--danger);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 13px;
+  cursor: pointer;
+}
+.checkbox input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.segmented {
+  display: inline-flex;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+.segmented button {
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.segmented button[data-active='true'] {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* ---- table ------------------------------------------------------------- */
+
+.table-wrap {
+  overflow-x: auto;
+}
+table.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  font-weight: 600;
+  padding: var(--space-3) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+table.table td {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+table.table tbody tr:last-child td {
+  border-bottom: none;
+}
+table.table tbody tr:hover {
+  background: var(--surface-2);
+}
+table.table tr[data-clickable='true'] {
+  cursor: pointer;
+}
+
+/* ---- misc -------------------------------------------------------------- */
+
+.empty {
+  padding: var(--space-7) var(--space-4);
+  text-align: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+.empty-icon {
+  font-size: 28px;
+  opacity: 0.5;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2));
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: var(--radius-sm);
+  height: 14px;
+}
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  border: 1px solid;
+  font-size: 13px;
+}
+.banner-danger {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: #ffd9d9;
+}
+.banner-warn {
+  background: var(--warn-soft);
+  border-color: var(--warn);
+  color: #ffe9b8;
+}
+.banner-info {
+  background: var(--info-soft);
+  border-color: var(--info);
+  color: #d3e5ff;
+}
+.banner-ok {
+  background: var(--ok-soft);
+  border-color: var(--ok);
+  color: #ccf6e4;
+}
+
+.divider {
+  height: 1px;
+  background: var(--border);
+  border: none;
+  margin: 0;
+}
+
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab {
+  padding: var(--space-3) var(--space-4);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+.tab[data-active='true'] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 7, 11, 0.72);
+  backdrop-filter: blur(3px);
+  display: grid;
+  place-items: center;
+  padding: var(--space-5);
+  z-index: 100;
+}
+.modal {
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  width: 100%;
+  max-width: 480px;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.toast-host {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: 200;
+  max-width: 380px;
+}
+.toast {
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-4);
+  font-size: 13px;
+  animation: slide-in 0.16s ease-out;
+}
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- customer-facing bits --------------------------------------------- */
+
+.hero {
+  background: linear-gradient(150deg, var(--surface-2), var(--surface-1) 65%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.dish {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  transition: background 0.12s, border-color 0.12s;
+}
+.dish:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+.dish-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dish-thumb {
+  width: 68px;
+  height: 68px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.qty {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--surface-3);
+  border-radius: var(--radius-full);
+  padding: 2px;
+}
+.qty button {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1;
+}
+.qty button:hover:not(:disabled) {
+  background: var(--surface-1);
+}
+.qty button:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.qty span {
+  min-width: 22px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.slot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+  gap: var(--space-2);
+}
+.slot {
+  padding: 6px 4px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+}
+.slot:hover {
+  border-color: var(--accent);
+}
+.slot[data-active='true'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #12161d;
+}
+
+.pickup-code {
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+
+.cart-bar {
+  position: sticky;
+  bottom: var(--space-4);
+  margin-top: var(--space-4);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+/* ---- BI report: inline bars and the hour chart (商戶營業報表) ----------- */
+
+/* A bar drawn with two divs rather than a charting library. It is a shape, not
+   a plot: no axes, no tooltip, no legend — so the whole thing is 60 bytes of
+   CSS instead of 90 kB of bundle. */
+.bar-track {
+  height: 6px;
+  width: 100%;
+  min-width: 56px;
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 240ms ease;
+}
+
+.hour-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 132px;
+}
+
+.hour-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+}
+
+.hour-bar-track {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+  /* The empty hours must still occupy their column, or the axis re-flows and
+     18:00 moves between days. A transparent floor keeps the spacing honest. */
+  background: linear-gradient(to top, var(--surface-2), transparent);
+  border-radius: 3px 3px 0 0;
+}
+
+.hour-bar {
+  width: 100%;
+  background: var(--accent);
+  border-radius: 3px 3px 0 0;
+  transition: height 240ms ease;
+}
+
+.hour-tick {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  height: 12px;
+  line-height: 12px;
+}
+
+/* ---- 現場候位: the guest's ticket page (mobile-first) ------------------ */
+
+/* The ticket number is the page. Sized so it is legible at arm's length in
+   daylight, which is the actual reading condition: a guest standing in a
+   doorway. `clamp` rather than a fixed size because the same page is opened on
+   a 320px phone and a tablet propped on a table. */
+.ticket-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: var(--space-5) var(--space-4);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  text-align: center;
+}
+
+/* The called state is the one that has to be impossible to miss — the guest is
+   in a corridor and the host is holding a table. Warm background, not a badge. */
+.ticket-hero[data-state='called'] {
+  background: color-mix(in srgb, var(--warn) 18%, var(--surface-2));
+  border-color: var(--warn);
+}
+
+.ticket-hero[data-state='ended'] {
+  opacity: 0.7;
+}
+
+.ticket-no {
+  font-size: clamp(46px, 17vw, 76px);
+  font-weight: 800;
+  line-height: 1.02;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A 48px minimum tap target: the interaction happens one-handed. */
+.step-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 26px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.step-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+
+.step-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.step-value {
+  min-width: 62px;
+  text-align: center;
+  font-size: 30px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 候位帶位板 / 桌面板: the merchant boards (tablet on a counter) ----- */
+
+/* A tiles grid rather than a table row. The board is read in a glance from a
+   metre away, so each party gets a card with the number at large size — a
+   dense table optimises for scanning many rows, which is the wrong goal when
+   the host is also talking to somebody. */
+.board-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.board-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--space-3);
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+/* 已叫號 is the state that needs a host's eyes: the guest is waiting somewhere
+   and the table is being held. A left edge, not a full tint, so the number
+   stays high-contrast. */
+.tile[data-state='called'] {
+  border-color: var(--warn);
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+
+.tile[data-state='ended'] {
+  opacity: 0.72;
+}
+
+.tile-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.tile-no {
+  font-size: 32px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* The party size — the second thing a host checks after the number, because
+   it decides which table they reach for. */
+.tile-party {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+/* On a narrow screen the tiles go full width — a tablet held in portrait, or a
+   phone used as the host board because the tablet is flat. */
+@media (max-width: 700px) {
+  .board-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- responsive -------------------------------------------------------- */
+
+@media (max-width: 860px) {
+  .shell {
+    flex-direction: column;
+  }
+  .nav {
+    width: 100%;
+    height: auto;
+    position: static;
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    padding: var(--space-3);
+    gap: var(--space-3);
+  }
+  .nav-group {
+    flex-direction: row;
+  }
+  .nav-group-title {
+    display: none;
+  }
+  .nav-foot {
+    margin-top: 0;
+    border-top: none;
+    padding-top: 0;
+    flex-direction: row;
+    margin-left: auto;
+  }
+  .page {
+    padding: var(--space-4);
+  }
+  .topbar {
+    padding: var(--space-3) var(--space-4);
+  }
+}

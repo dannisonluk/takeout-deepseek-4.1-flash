@@ -1,0 +1,1582 @@
+// ============================================================================
+//  外賣自取平台 — Prisma schema
+// ============================================================================
+//  Conventions
+//  -----------
+//  * Money is ALWAYS an integer number of minor units (cents). `Int` is 32-bit,
+//    so a single row tops out at HK$21,474,836.47 — far above any single order.
+//    Rolling aggregates (MerchantPayout) use `BigInt`.
+//  * Timestamps are `timestamptz(3)`. All business logic runs in UTC and is
+//    rendered in `Merchant.timezone` (default Asia/Hong_Kong).
+//  * Every foreign key is explicit and every hot query path has an index.
+//  * Bounded contexts, in the order they appear below:
+//        identity  -> users, addresses
+//        merchant  -> merchants, hours, staff, menu
+//        ordering  -> orders, order_items, order_status_events
+//        payment   -> payments, refunds, merchant_payouts
+//        platform  -> platform_config, outbox_events
+//        fleet     -> PHASE 2 placeholders (driver_profiles, delivery_tasks)
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  // PostGIS is deliberately NOT listed here. It is a *capability*, not a
+  // requirement: `prisma/sql/post-init.sql` adds the `geography` column, its
+  // GIST index and the sync trigger only when the extension is available.
+  // That keeps the schema installable on a plain PostgreSQL (local dev, CI)
+  // while a PostGIS-enabled server still gets indexed geo queries.
+  extensions = [pg_trgm, pgcrypto]
+}
+
+// ============================================================================
+//  Enums
+// ============================================================================
+
+enum UserRole {
+  CUSTOMER
+  MERCHANT_OWNER
+  MERCHANT_STAFF
+  RIDER // phase 2
+  ADMIN
+}
+
+enum MerchantStatus {
+  DRAFT
+  PENDING_REVIEW
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum MenuItemAvailability {
+  AVAILABLE
+  SOLD_OUT
+  HIDDEN
+}
+
+/// Mirrors `OrderStatus` in @takeout/domain. Keep the two in lockstep.
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  ACCEPTED
+  PREPARING
+  READY_FOR_PICKUP
+  COMPLETED
+  REJECTED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum OrderActorType {
+  CUSTOMER
+  MERCHANT
+  SYSTEM
+  ADMIN
+}
+
+enum FulfilmentMode {
+  SELF_PICKUP
+  PLATFORM_FLEET
+  MERCHANT_FLEET
+}
+
+enum PriorityLevel {
+  NORMAL
+  EXPRESS
+}
+
+/// How the customer intends to pay.
+///
+/// `PAY_AT_STORE` is not a fallback for a broken PSP — it is the default
+/// arrangement for a great many Hong Kong shops, and pretending otherwise is
+/// what forces a merchant to run two systems. The consequence that matters:
+/// an order paid at the counter is settled by a **human**, so it is the
+/// merchant, not a webhook, that drives `PENDING_PAYMENT -> PAID`.
+enum PaymentMode {
+  /// A rail captures the money; a signed webhook advances the order.
+  ONLINE
+  /// Cash / FPS / PayMe at the counter. The merchant confirms receipt.
+  PAY_AT_STORE
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYME
+  OCTOPUS
+  FPS_QR
+  APPLE_PAY
+  GOOGLE_PAY
+  /// Money taken outside the platform — cash at the counter, or an FPS/PayMe
+  /// transfer the merchant confirmed by hand.
+  ///
+  /// It is a `PaymentProvider` because the row has to exist: without it, a
+  /// pay-at-store order that is later cancelled has no record that any money
+  /// changed hands, and the merchant has no way to see what they already
+  /// collected. It is deliberately **not** an `IPaymentProvider` — there is no
+  /// rail to call, which is why `RefundService` short-circuits on it.
+  MANUAL
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+  DEAD_LETTER
+}
+
+/// PHASE 2
+enum DriverStatus {
+  OFFLINE
+  ONLINE_IDLE
+  ON_DELIVERY
+  SUSPENDED
+}
+
+/// PHASE 2
+enum IdentityVerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// PHASE 2
+enum DeliveryVehicle {
+  MOTORCYCLE
+  BICYCLE
+  ON_FOOT
+}
+
+/// PHASE 2
+enum DeliveryTaskStatus {
+  OFFERED
+  ASSIGNED
+  PICKED_UP
+  DELIVERED
+  CANCELLED
+  FAILED
+}
+
+/// The three derivatives the image pipeline always produces.
+///
+/// Deliberately **not** a database enum. The variants live inside
+/// `image_assets.variants`, which is `Json` — so a Postgres enum would enforce
+/// nothing while adding a type that has to be migrated whenever a size is
+/// added. Prisma also prunes an enum no column uses, so declaring it here only
+/// produced a database type with no corresponding client export. The vocabulary
+/// is TypeScript: `apps/api/src/modules/media/domain/image-variant.ts`.
+enum ImageAssetStatus {
+  /// Written before the bytes are touched, so a process that dies mid-decode
+  /// leaves a row an operator can find instead of a silent gap.
+  PENDING
+  READY
+  /// sharp could not decode it, or a derivative could not be stored. The reason
+  /// is kept: "the upload failed" is not actionable, "not a valid WebP" is.
+  FAILED
+}
+
+/// What a shop is entitled to, commercially.
+///
+/// Deliberately **not** a `UserRole`. A role answers "who are you"; this answers
+/// "what did you buy". Putting it on the user would mean the entitlement walks
+/// out of the door with the manager who happened to create the account.
+enum AnalyticsTier {
+  /// Free. Raw rows only — the "export to Excel" the merchant already gets.
+  NONE
+  /// Computed aggregates: revenue by day, item mix, hour-of-day heat.
+  BASIC
+  /// Everything, including cohort/retention and comparison windows.
+  PRO
+}
+
+/// A **temporary** closure: a public holiday, a private event, a broken fridge.
+///
+/// Kept separate from `MerchantOperatingHour` on purpose — that table holds the
+/// weekly *pattern* (one row per weekday, `@@unique([merchantId, dayOfWeek])`),
+/// and a closure is a dated exception to it. Folding exceptions into the weekly
+/// rows would need one row per calendar date and blow up the unique key.
+enum ClosureReason {
+  PUBLIC_HOLIDAY
+  STAFF_HOLIDAY
+  PRIVATE_EVENT
+  MAINTENANCE
+  OTHER
+}
+
+/// Lifecycle of a walk-in queue ticket.
+///
+/// Deliberately smaller than `ReservationStatus`: a walk-in has no lead time and
+/// no `PENDING` — taking a ticket *is* the confirmation. `CALLED` exists because
+/// the gap between "your table is ready" and "you sat down" is exactly where the
+/// queue is lost, and it needs to be visible to the shop.
+enum WaitlistStatus {
+  WAITING
+  CALLED
+  SEATED
+  NO_SHOW
+  CANCELLED
+}
+
+enum RefundRequestStatus {
+  /// Customer filed it. The shop has not looked yet.
+  OPEN
+  /// The shop is talking to the customer.
+  IN_DISCUSSION
+  /// The shop says money was handed back outside the platform. Recorded, never
+  /// verified — the platform is not in the money path for this flow.
+  RESOLVED_OFFLINE
+  DECLINED
+  /// Customer withdrew it.
+  CANCELLED
+}
+
+/// Why the customer says they want money back. Kept as a vocabulary rather than
+/// free text so the shop can filter a busy queue and the admin console can
+/// report on it.
+enum RefundReasonCode {
+  NEVER_RECEIVED
+  WRONG_ITEM
+  QUALITY
+  LATE
+  DUPLICATE_CHARGE
+  OTHER
+}
+
+enum DiningSessionStatus {
+  OPEN
+  /// Bill settled, table turned around.
+  CLOSED
+  /// Nobody came, or the party left without ordering.
+  ABANDONED
+}
+
+// ============================================================================
+//  identity
+// ============================================================================
+
+model User {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone       String?   @unique @db.VarChar(32)
+  email       String?   @unique @db.VarChar(255)
+  displayName String    @db.VarChar(120)
+  avatarKey   String?   @db.VarChar(512)
+  role        UserRole  @default(CUSTOMER)
+  locale      String    @default("zh-HK") @db.VarChar(16)
+  isActive    Boolean   @default(true)
+  lastLoginAt DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  ownedMerchants Merchant[]              @relation("MerchantOwner")
+  staffRoles     MerchantStaff[]
+  orders         Order[]                 @relation("CustomerOrders")
+  addresses      CustomerAddress[]
+  driverProfile  DriverProfile?          @relation("UserDriverProfile")
+  statusEvents   OrderStatusEvent[]      @relation("ActorStatusEvents")
+  refreshTokens  RefreshToken[]
+  auditLogs      AuditLog[]              @relation("ActorAuditLogs")
+  reviews        Review[]                @relation("CustomerReviews")
+  hiddenReviews  Review[]                @relation("ReviewHiddenBy")
+  configChanges  PlatformConfigHistory[] @relation("ConfigHistoryAuthor")
+  imageAssets    ImageAsset[]            @relation("ImageAssetAuthor")
+  reservations   Reservation[]           @relation("CustomerReservations")
+  refundRequests RefundRequest[]         @relation("CustomerRefundRequests")
+  diningSessions DiningSession[]         @relation("DiningSessionGuest")
+
+  @@index([role, isActive])
+  @@index([createdAt])
+  @@map("users")
+}
+
+model CustomerAddress {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId  String  @db.Uuid
+  label       String  @db.VarChar(60)
+  addressLine String  @db.VarChar(255)
+  district    String? @db.VarChar(80)
+  region      String  @default("HK") @db.VarChar(40)
+  latitude    Float?
+  longitude   Float?
+  isDefault   Boolean @default(false)
+
+  customer User @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@map("customer_addresses")
+}
+
+// ============================================================================
+//  auth  — login, sessions, and the privileged-action audit trail
+// ============================================================================
+
+/// One-time password for phone login.
+///
+/// Deliberately stored in Postgres rather than Redis. Redis is an optional
+/// dependency in this deployment, and "nobody can log in" must not be one of
+/// the consequences of a missing cache. The code is stored **hashed**: a leaked
+/// database backup must not hand out working login codes.
+model OtpCode {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone      String    @db.VarChar(32)
+  /// SHA-256 of `<phone>:<code>`. Never the code itself.
+  codeHash   String    @db.VarChar(128)
+  /// LOGIN today; PHONE_CHANGE / PAYOUT_CONFIRM later.
+  purpose    String    @default("LOGIN") @db.VarChar(32)
+  /// Incremented on every failed verify; the code dies at a fixed ceiling.
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @db.Timestamptz(3)
+  consumedAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+
+  /// The verify path's only query: newest live code for this phone.
+  @@index([phone, purpose, createdAt(sort: Desc)])
+  /// Expiry sweeper.
+  @@index([expiresAt])
+  @@map("otp_codes")
+}
+
+/// A refresh token, stored hashed and **rotated on every use**.
+///
+/// Rotation is what makes theft detectable: presenting an already-rotated token
+/// means either a replay or a stolen copy, and both warrant revoking the chain.
+/// `replacedById` is what lets the revoke walk forwards from the reused token.
+model RefreshToken {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String    @db.Uuid
+  /// SHA-256 of the opaque token. The token itself is never stored.
+  tokenHash    String    @unique @db.VarChar(128)
+  expiresAt    DateTime  @db.Timestamptz(3)
+  revokedAt    DateTime? @db.Timestamptz(3)
+  replacedById String?   @db.Uuid
+  userAgent    String?   @db.VarChar(255)
+  ip           String?   @db.VarChar(64)
+  createdAt    DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Append-only record of every privileged mutation.
+///
+/// `before` / `after` hold only the changed fields, so "who moved the platform
+/// fee from 3.50 to 6.00, and when" is answerable without a diff tool. Nothing
+/// in the codebase updates or deletes a row here.
+model AuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorId    String?  @db.Uuid
+  /// Denormalised so the trail survives a role change.
+  actorRole  String?  @db.VarChar(32)
+  /// e.g. `platform_config.update`, `merchant.suspend`, `order.force_transition`.
+  action     String   @db.VarChar(80)
+  targetType String   @db.VarChar(60)
+  targetId   String?  @db.Uuid
+  before     Json?
+  after      Json?
+  ip         String?  @db.VarChar(64)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  actor User? @relation("ActorAuditLogs", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([targetType, targetId, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+//  merchant
+// ============================================================================
+
+model Merchant {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerId String @db.Uuid
+
+  slug        String  @unique @db.VarChar(120)
+  name        String  @db.VarChar(160)
+  nameEn      String? @db.VarChar(160)
+  description String? @db.Text
+  phone       String? @db.VarChar(32)
+
+  /// Cloudflare R2 object keys — never public URLs.
+  logoKey       String? @db.VarChar(512)
+  coverImageKey String? @db.VarChar(512)
+
+  status MerchantStatus @default(DRAFT)
+
+  addressLine1 String  @db.VarChar(255)
+  addressLine2 String? @db.VarChar(255)
+  district     String? @db.VarChar(80)
+  region       String  @default("HK") @db.VarChar(40)
+  latitude     Float
+  longitude    Float
+  /// PostGIS `geography(Point, 4326)` is added by `prisma/sql/post-init.sql`
+  /// ONLY when the extension is available on the server, along with its GIST
+  /// index and a BEFORE INSERT/UPDATE trigger that derives it from
+  /// `latitude`/`longitude`. Prisma cannot model `geography`, so declaring it
+  /// here would make the schema uninstallable on a plain PostgreSQL.
+  /// Without PostGIS the same script installs a btree index on
+  /// (latitude, longitude) for bounding-box search.
+  /// See docs/ARCHITECTURE.md § "Geo strategy".
+
+  /// Estimated kitchen time shown to the customer before they order.
+  prepTimeMinutes     Int @default(15)
+  /// Per-merchant override of the platform's pickup window.
+  pickupWindowMinutes Int @default(60)
+
+  /// 接單 / 停單 switch. Enforced by the MERCHANT_ACCEPTING guard.
+  acceptsOrders        Boolean @default(true)
+  autoAcceptOrders     Boolean @default(false)
+  /// How long the merchant has to accept before the order expires.
+  acceptTimeoutMinutes Int     @default(5)
+
+  timezone    String   @default("Asia/Hong_Kong") @db.VarChar(64)
+  ratingAvg   Decimal? @db.Decimal(3, 2)
+  ratingCount Int      @default(0)
+
+  /// Which analytics the shop is entitled to. The **entitlement lives on the
+  /// merchant, not the user** — a shop buys the feature, and the manager who
+  /// happens to hold the account today must not be able to take it with them.
+  /// `NONE` (default) can still export raw rows to Excel; the computed BI
+  /// dashboard is `PRO`.
+  analyticsTier AnalyticsTier @default(NONE)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  owner       User                    @relation("MerchantOwner", fields: [ownerId], references: [id])
+  staff       MerchantStaff[]
+  hours       MerchantOperatingHour[]
+  closures    MerchantClosure[]
+  categories  MenuCategory[]
+  menuItems   MenuItem[]
+  orders      Order[]
+  payments    Payment[]
+  payouts     MerchantPayout[]
+  dailyStocks MenuItemDailyStock[]
+  reviews     Review[]
+  imageAssets ImageAsset[]
+
+  reservationSettings ReservationSettings?
+  reservations        Reservation[]
+  reservationSlots    ReservationSlot[]
+
+  waitlistSettings WaitlistSettings?
+  waitlistEntries  WaitlistEntry[]
+
+  tables      DiningTable[]
+  diningSessions DiningSession[]
+
+  refundRequests RefundRequest[]
+
+  @@index([status, acceptsOrders])
+  @@index([district, status])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("merchants")
+}
+
+model MerchantStaff {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String   @db.Uuid
+  userId     String   @db.Uuid
+  isManager  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, userId])
+  @@index([userId])
+  @@map("merchant_staff")
+}
+
+model MerchantOperatingHour {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId     String  @db.Uuid
+  /// 0 = Sunday … 6 = Saturday (JS `Date.getDay()`).
+  dayOfWeek      Int
+  /// Minutes from midnight, in the merchant's timezone. 11:00 => 660.
+  opensAtMinute  Int
+  closesAtMinute Int
+  isClosed       Boolean @default(false)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, dayOfWeek])
+  @@index([merchantId])
+  @@map("merchant_operating_hours")
+}
+
+model MenuCategory {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String  @db.Uuid
+  name       String  @db.VarChar(120)
+  nameEn     String? @db.VarChar(120)
+  sortOrder  Int     @default(0)
+  isActive   Boolean @default(true)
+
+  merchant Merchant   @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  items    MenuItem[]
+
+  @@unique([merchantId, name])
+  @@index([merchantId, sortOrder])
+  @@map("menu_categories")
+}
+
+model MenuItem {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String  @db.Uuid
+  categoryId String? @db.Uuid
+
+  name        String  @db.VarChar(160)
+  nameEn      String? @db.VarChar(160)
+  description String? @db.Text
+
+  /// Cloudflare R2 object key, e.g. `merchants/<id>/items/<id>.webp`.
+  imageKey      String? @db.VarChar(512)
+  imageBlurhash String? @db.VarChar(120)
+
+  /// Minor units. HK$58.00 => 5800.
+  priceMinor Int
+  currency   String @default("HKD") @db.VarChar(3)
+
+  /// THE pricing flag: only main items incur the per-item platform fee.
+  isMainItem Boolean @default(false)
+
+  availability MenuItemAvailability @default(AVAILABLE)
+
+  /// Daily supply cap. `null` = unlimited. 每日供應量上限.
+  dailyQuota Int?
+
+  prepTimeMinutes Int?
+  sortOrder       Int  @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant    Merchant             @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  category    MenuCategory?        @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  orderItems  OrderItem[]
+  dailyStocks MenuItemDailyStock[]
+
+  @@index([merchantId, availability, sortOrder])
+  @@index([categoryId])
+  @@map("menu_items")
+}
+
+/// One row per item per service day. Holds the soft-held quota so an order can
+/// be released back on cancellation.
+model MenuItemDailyStock {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  menuItemId  String   @db.Uuid
+  merchantId  String   @db.Uuid
+  /// Merchant-local service date, e.g. 2026-09-24.
+  serviceDate DateTime @db.Date
+
+  quota Int @default(0)
+  sold  Int @default(0)
+  /// Units held by orders that are created but not yet paid.
+  held  Int @default(0)
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([menuItemId, serviceDate])
+  @@index([merchantId, serviceDate])
+  @@map("menu_item_daily_stock")
+}
+
+// ============================================================================
+//  ordering
+// ============================================================================
+
+model Order {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNo    String  @unique @db.VarChar(24)
+  /// Short counter code shown on the pickup screen, e.g. `A-07`.
+  pickupCode String? @db.VarChar(8)
+
+  customerId String @db.Uuid
+  merchantId String @db.Uuid
+
+  status OrderStatus @default(PENDING_PAYMENT)
+
+  fulfilmentMode FulfilmentMode @default(SELF_PICKUP)
+  priority       PriorityLevel  @default(NORMAL)
+  paymentMode    PaymentMode    @default(ONLINE)
+
+  /// The caller's `Idempotency-Key`, when one was supplied.
+  ///
+  /// UNIQUE, and this is the *real* guarantee against a double-submitted
+  /// checkout. The Redis lock the controller takes first is only a fast path:
+  /// with this column absent, an unreachable Redis turned every idempotent
+  /// order into a 500 and nobody could order at all. Nullable because a caller
+  /// is not obliged to send one — the API only promises idempotency when it is.
+  idempotencyKey String? @unique @db.VarChar(120)
+
+  /// `null` = 即時製作 (as soon as possible). Otherwise 指定時間預訂取餐.
+  scheduledPickupAt DateTime? @db.Timestamptz(3)
+  /// Merchant-local service date — drives daily reporting and quota resets.
+  serviceDate       DateTime  @db.Date
+  prepTimeMinutes   Int
+
+  /// The **promise**, as opposed to `scheduledPickupAt`, which is the request.
+  ///
+  /// A customer asks for 18:30; the kitchen answers "it will be ready at
+  /// 18:45". Before this column the two were conflated, so a merchant could
+  /// only ever accept the customer's time or reject the order — there was no
+  /// way to say "yes, but twenty minutes later", which is the single most
+  /// common real-world reply. Set when the merchant confirms; `null` until
+  /// then, which is why the customer view treats it as "not yet quoted".
+  estimatedReadyAt DateTime? @db.Timestamptz(3)
+  /// How the promise was expressed, kept for the customer timeline. Minutes
+  /// from the confirmation moment — `estimatedReadyAt` is the derived fact.
+  readyInMinutes Int?
+  /// Free-text message from the kitchen to the customer, shown verbatim on the
+  /// tracking page ("前面還有四張單，大約遲十分鐘").
+  merchantNote String? @db.Text
+
+  acceptedAt       DateTime? @db.Timestamptz(3)
+  readyAt          DateTime? @db.Timestamptz(3)
+  completedAt      DateTime? @db.Timestamptz(3)
+  cancelledAt      DateTime? @db.Timestamptz(3)
+  /// Deadline for the merchant to accept, computed at payment time.
+  acceptDeadlineAt DateTime? @db.Timestamptz(3)
+
+  // ---- money, all in minor units -------------------------------------------
+  currency                String @default("HKD") @db.VarChar(3)
+  subtotalMinor           Int
+  platformFeeMinor        Int
+  paymentFeeMinor         Int
+  customerServiceFeeMinor Int    @default(0)
+  totalMinor              Int
+  merchantPayoutMinor     Int
+  /// Count of main items — the multiplier behind `platformFeeMinor`.
+  mainItemCount           Int
+
+  /// Frozen `PricingSnapshot` from the domain PricingEngine. Never recomputed:
+  /// a later rate change must not rewrite history.
+  pricingSnapshot Json
+
+  /// What `CancellationPolicyEngine` decided to return when this order ended.
+  ///
+  /// Persisted rather than recomputed, for the same reason as `pricingSnapshot`:
+  /// the refund reactor may run minutes later, after an operator has retuned the
+  /// policy, and the customer must get the amount they were promised. `null`
+  /// means no cancellation policy was consulted — every order that predates the
+  /// column, which the reactor treats as "refund the full refundable balance".
+  refundDueMinor   Int?
+  /// The `CancellationTier` behind `refundDueMinor`, for the admin timeline.
+  cancellationTier String? @db.VarChar(24)
+
+  customerNote String? @db.Text
+  /// Contact phone for pickup notification, if different from the account.
+  contactPhone String? @db.VarChar(32)
+
+  /// PHASE 2: set once a rider is assigned.
+  deliveryTaskId String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  customer     User                 @relation("CustomerOrders", fields: [customerId], references: [id])
+  merchant     Merchant             @relation(fields: [merchantId], references: [id])
+  items        OrderItem[]
+  statusEvents OrderStatusEvent[]
+  payments     Payment[]
+  payoutLines  MerchantPayoutLine[]
+  deliveryTask DeliveryTask?        @relation("OrderDeliveryTask")
+  review       Review?
+  /// Set only for a dine-in order. Null for every collection order, including
+  /// all of Phase 1 — which is why this is nullable rather than defaulting to
+  /// some sentinel session.
+  diningSessionId String?     @db.Uuid
+  diningSession   DiningSession? @relation(fields: [diningSessionId], references: [id], onDelete: SetNull)
+
+  refundRequests RefundRequest[]
+
+  /// Kitchen board: "everything active for this merchant, newest first".
+  @@index([merchantId, status, createdAt(sort: Desc)])
+  /// Customer order history.
+  @@index([customerId, createdAt(sort: Desc)])
+  /// Expiry sweeper: "unaccepted orders past their deadline".
+  @@index([status, acceptDeadlineAt])
+  /// Scheduled-pickup reminders.
+  @@index([status, scheduledPickupAt])
+  /// Payout aggregation for a service day.
+  @@index([merchantId, serviceDate, status])
+  /// The table's running tab within one sitting.
+  @@index([diningSessionId, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId    String  @db.Uuid
+  menuItemId String? @db.Uuid
+
+  /// Denormalised at order time so a menu edit cannot rewrite a receipt.
+  nameSnapshot     String  @db.VarChar(160)
+  imageKeySnapshot String? @db.VarChar(512)
+  unitPriceMinor   Int
+  quantity         Int
+  lineTotalMinor   Int
+  /// Snapshot of the flag that drove `platformFeeMinor`.
+  isMainItem       Boolean
+
+  order    Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem? @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([menuItemId])
+  @@map("order_items")
+}
+
+/// Append-only audit trail. One row per accepted transition.
+model OrderStatusEvent {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId String @db.Uuid
+
+  fromStatus  OrderStatus?
+  toStatus    OrderStatus
+  actor       OrderActorType
+  actorId     String?        @db.Uuid
+  reason      String?        @db.Text
+  /// JSONB copy of the side-effect list the transition obliged.
+  sideEffects Json?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actorUser User? @relation("ActorStatusEvents", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+  @@index([toStatus, createdAt])
+  @@map("order_status_events")
+}
+
+// ============================================================================
+//  feedback
+// ============================================================================
+
+/// A customer's rating of one collected order.
+///
+/// Keyed on the order rather than on (customer, merchant) because the unit of
+/// experience is the meal, not the relationship: a customer who ate there six
+/// times may legitimately rate one visit badly. The `@unique` on `orderId` is
+/// what stops the same meal being rated twice — the difference between
+/// "feedback" and "review bombing".
+///
+/// `Merchant.ratingAvg` / `ratingCount` are a denormalised cache of this table,
+/// recomputed inside the writing transaction. They are what discovery ranks on,
+/// so a stale value is a wrong sort order, not just a cosmetic lag.
+model Review {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId    String @unique @db.Uuid
+  merchantId String @db.Uuid
+  customerId String @db.Uuid
+
+  /// 1–5. Also CHECK-constrained in `prisma/sql/post-init.sql`, because the
+  /// average shown to customers is only meaningful if the inputs are sane.
+  rating  Int
+  comment String?  @db.Text
+  /// Chosen from a fixed vocabulary — free-text tags cannot be aggregated.
+  tags    String[] @default([])
+
+  /// The merchant's single public reply. A second reply replaces the first.
+  merchantReply     String?   @db.Text
+  merchantRepliedAt DateTime? @db.Timestamptz(3)
+
+  /// Operator moderation. The row is kept rather than deleted so the decision
+  /// itself is auditable, and so a hidden review cannot be re-posted.
+  hiddenAt     DateTime? @db.Timestamptz(3)
+  hiddenById   String?   @db.Uuid
+  hiddenReason String?   @db.Text
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customer User     @relation("CustomerReviews", fields: [customerId], references: [id], onDelete: Cascade)
+  hiddenBy User?    @relation("ReviewHiddenBy", fields: [hiddenById], references: [id], onDelete: SetNull)
+
+  /// The public merchant page: visible reviews, newest first. `hiddenAt` is in
+  /// the index because every public read filters on it.
+  @@index([merchantId, hiddenAt, createdAt(sort: Desc)])
+  /// "My reviews" in the customer account page.
+  @@index([customerId, createdAt(sort: Desc)])
+  @@map("reviews")
+}
+
+// ============================================================================
+//  payment
+// ============================================================================
+
+model Payment {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId    String @db.Uuid
+  merchantId String @db.Uuid
+
+  provider       PaymentProvider
+  /// Idempotency key issued by us; unique so a retried webhook cannot double-charge.
+  idempotencyKey String          @unique @db.VarChar(120)
+  /// Provider-side identifier (Stripe PaymentIntent id, PayMe txn id, …).
+  providerRef    String?         @db.VarChar(160)
+
+  status             PaymentStatus @default(PENDING)
+  currency           String        @default("HKD") @db.VarChar(3)
+  amountMinor        Int
+  /// PSP cost recorded at capture time, mirrored onto the order.
+  processingFeeMinor Int           @default(0)
+
+  failureCode    String? @db.VarChar(80)
+  failureMessage String? @db.Text
+
+  authorizedAt DateTime? @db.Timestamptz(3)
+  capturedAt   DateTime? @db.Timestamptz(3)
+
+  /// Raw provider payload, kept for reconciliation and dispute handling.
+  rawPayload Json?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  merchant Merchant @relation(fields: [merchantId], references: [id])
+  refunds  Refund[]
+
+  @@unique([provider, providerRef])
+  @@index([orderId, status])
+  @@index([merchantId, createdAt(sort: Desc)])
+  @@map("payments")
+}
+
+model Refund {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId   String       @db.Uuid
+  amountMinor Int
+  reason      String       @db.Text
+  status      RefundStatus @default(PENDING)
+  providerRef String?      @db.VarChar(160)
+  /// Who triggered it — order state machine side effect or a manual admin action.
+  requestedBy String?      @db.Uuid
+  createdAt   DateTime     @default(now()) @db.Timestamptz(3)
+  settledAt   DateTime?    @db.Timestamptz(3)
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId, status])
+  @@map("refunds")
+}
+
+/// Weekly (or on-demand) settlement batch for one merchant.
+model MerchantPayout {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+
+  periodStart DateTime     @db.Timestamptz(3)
+  periodEnd   DateTime     @db.Timestamptz(3)
+  status      PayoutStatus @default(PENDING)
+
+  /// BigInt: a chain settling across many stores can exceed 32-bit minor units.
+  grossSubtotalMinor BigInt
+  platformFeeMinor   BigInt
+  paymentFeeMinor    BigInt
+  netPayoutMinor     BigInt
+  orderCount         Int
+
+  currency  String    @default("HKD") @db.VarChar(3)
+  /// Bank transfer / FPS reference.
+  reference String?   @db.VarChar(120)
+  paidAt    DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant             @relation(fields: [merchantId], references: [id])
+  lines    MerchantPayoutLine[]
+
+  @@unique([merchantId, periodStart, periodEnd])
+  @@index([status, periodEnd])
+  @@map("merchant_payouts")
+}
+
+model MerchantPayoutLine {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  payoutId String @db.Uuid
+  orderId  String @db.Uuid
+
+  subtotalMinor       Int
+  platformFeeMinor    Int
+  paymentFeeMinor     Int
+  merchantPayoutMinor Int
+
+  payout MerchantPayout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  order  Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  /// An order may be settled exactly once.
+  @@unique([orderId])
+  @@index([payoutId])
+  @@map("merchant_payout_lines")
+}
+
+// ============================================================================
+//  platform
+// ============================================================================
+
+/// Runtime-tunable configuration, including the HK$3.50 per-item fee.
+/// Resolution order at boot: PlatformConfig row -> env var -> code default.
+model PlatformConfig {
+  key         String   @id @db.VarChar(120)
+  value       Json
+  description String?  @db.Text
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("platform_config")
+}
+
+/// Append-only record of every write to `platform_config`.
+///
+/// `AuditLog` also captures these writes, but it is a general-purpose trail
+/// keyed on the actor and cannot answer the question an operator actually asks
+/// — "what did this *key* used to be, and when did it change?" — without a
+/// table scan. The fee is the platform's revenue; being able to say what it was
+/// on any past date is the point.
+model PlatformConfigHistory {
+  id  String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key String @db.VarChar(120)
+
+  /// `UPSERT` (a value was set) or `DELETE` (the override was removed, so the
+  /// environment / code default came back into force).
+  action String @db.VarChar(16)
+
+  previousValue Json?
+  newValue      Json?
+  description   String?  @db.Text
+  changedById   String?  @db.Uuid
+  changedAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  changedBy User? @relation("ConfigHistoryAuthor", fields: [changedById], references: [id], onDelete: SetNull)
+
+  /// "The history of this key, newest first" — the only read there is.
+  @@index([key, changedAt(sort: Desc)])
+  @@map("platform_config_history")
+}
+
+/// A processed image: the original as uploaded, plus the three derivatives the
+/// pipeline derives from it.
+///
+/// Before this table the platform stored a single `objectKey` per image and
+/// served the merchant's 4 MB camera JPEG to every phone in the discovery list.
+/// The derivatives are what make the list usable on a mobile connection, and the
+/// blurhash is what makes it not flash empty while they load.
+model ImageAsset {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+
+  /// `MENU_ITEM` | `MERCHANT_LOGO` | `MERCHANT_COVER` — mirrors `MediaScope`.
+  scope String @db.VarChar(24)
+
+  /// The bytes as uploaded, kept so a future pipeline change can re-derive the
+  /// variants without asking the merchant to upload again.
+  originalKey String @db.VarChar(512)
+  contentType String @db.VarChar(64)
+  sizeBytes   Int
+
+  /// SHA-256 of the uploaded bytes. Together with `merchantId` this is unique,
+  /// so re-uploading the same file is a no-op rather than a second copy — and
+  /// an upload that is retried after a timeout cannot duplicate the asset.
+  checksum String @db.VarChar(64)
+
+  /// Of the ORIGINAL, not of a derivative.
+  width  Int?
+  height Int?
+
+  /// BlurHash placeholder. ~28 characters that the client renders as a blurred
+  /// rectangle while the real image loads. Null only when sharp could not read
+  /// the pixels at all — which also means `status` is FAILED.
+  blurhash String? @db.VarChar(64)
+
+  /// `{ "THUMB": { "key", "width", "height", "bytes" }, "CARD": {...}, "FULL": {...} }`
+  /// Keys rather than URLs: the bucket and CDN domain stay swappable without a
+  /// migration, the same rule `Merchant.logoKey` follows.
+  variants Json?
+
+  status        ImageAssetStatus @default(PENDING)
+  failureReason String?          @db.Text
+
+  createdById String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant  Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  createdBy User?    @relation("ImageAssetAuthor", fields: [createdById], references: [id], onDelete: SetNull)
+
+  /// The idempotency key for "upload this file to this merchant".
+  @@unique([merchantId, checksum])
+  /// "This merchant's images, newest first" — the only list there is.
+  @@index([merchantId, scope, createdAt(sort: Desc)])
+  /// A dashboard counting failures, and the retention job's scan.
+  @@index([status, createdAt])
+  @@map("image_assets")
+}
+
+/// Transactional outbox. Written in the SAME transaction as the order update,
+/// then relayed to Redis Streams -> WebSocket by a background worker.
+/// This is what makes "order saved but notification lost" impossible.
+model OutboxEvent {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  aggregateType String @db.VarChar(60)
+  aggregateId   String @db.Uuid
+  /// e.g. `order.ready_for_pickup`
+  eventType     String @db.VarChar(120)
+  payload       Json
+  /// Monotonic per aggregate — consumers detect out-of-order delivery.
+  version       Int
+
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?      @db.Text
+  availableAt DateTime     @default(now()) @db.Timestamptz(3)
+  publishedAt DateTime?    @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  /// The relay's work queue: oldest un-published event first.
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId, version])
+  @@map("outbox_events")
+}
+
+// ============================================================================
+//  fleet  (PHASE 2 — schema is in place so migrations never need a rewrite)
+// ============================================================================
+
+model DriverProfile {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @unique @db.Uuid
+
+  displayName String          @db.VarChar(120)
+  phone       String          @db.VarChar(32)
+  vehicle     DeliveryVehicle @default(MOTORCYCLE)
+
+  status       DriverStatus               @default(OFFLINE)
+  verification IdentityVerificationStatus @default(UNVERIFIED)
+  /// Reference to the uploaded HKID / licence in R2.
+  documentKey  String?                    @db.VarChar(512)
+  verifiedAt   DateTime?                  @db.Timestamptz(3)
+
+  maxConcurrentTasks Int     @default(3)
+  acceptanceRate     Decimal @default(1.0) @db.Decimal(4, 3)
+  completedTaskCount Int     @default(0)
+
+  /// `null` = may serve any merchant.
+  allowedMerchantIds String[] @db.Uuid
+
+  onlineSince DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  user  User           @relation("UserDriverProfile", fields: [userId], references: [id], onDelete: Cascade)
+  tasks DeliveryTask[]
+
+  /// Roster lookup: "who is online and has capacity".
+  @@index([status, verification])
+  @@map("driver_profiles")
+}
+
+model DeliveryTask {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId    String  @unique @db.Uuid
+  merchantId String  @db.Uuid
+  riderId    String? @db.Uuid
+
+  mode   FulfilmentMode     @default(PLATFORM_FLEET)
+  status DeliveryTaskStatus @default(OFFERED)
+
+  pickupLatitude      Float
+  pickupLongitude     Float
+  dropoffLatitude     Float
+  dropoffLongitude    Float
+  estimatedDistanceKm Float?
+  etaMinutes          Int?
+
+  assignedAt  DateTime? @db.Timestamptz(3)
+  pickedUpAt  DateTime? @db.Timestamptz(3)
+  deliveredAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  order Order          @relation("OrderDeliveryTask", fields: [orderId], references: [id], onDelete: Cascade)
+  rider DriverProfile? @relation(fields: [riderId], references: [id], onDelete: SetNull)
+
+  /// Live rider workload count.
+  @@index([riderId, status])
+  @@index([merchantId, status])
+  @@map("delivery_tasks")
+}
+
+// ============================================================================
+//  reservation — 預約訂位
+// ============================================================================
+//
+// A reservation is a different aggregate from an order, and deliberately does
+// not reuse `OrderStatus`: a booking has no payment leg, no quota, and its
+// terminal states are not a subset of the order's. Sharing the enum would have
+// forced every order status to be meaningful for a table booking.
+
+enum ReservationStatus {
+  /// Submitted, waiting for the shop.
+  PENDING
+  /// Accepted, or auto-accepted by `autoConfirm`.
+  CONFIRMED
+  /// The party is at the table.
+  SEATED
+  /// They ate and left.
+  COMPLETED
+  /// The shop refused.
+  DECLINED
+  CANCELLED
+  /// Confirmed, but nobody turned up.
+  NO_SHOW
+}
+
+/// The shop's reservation book. One row per merchant, created lazily.
+///
+/// Absent means "not configured", which resolves to
+/// `DEFAULT_RESERVATION_POLICY` — where `enabled` is false. A merchant who never
+/// opened this screen must not start receiving bookings because the platform
+/// shipped a feature.
+model ReservationSettings {
+  merchantId String @id @db.Uuid
+
+  enabled     Boolean @default(false)
+  autoConfirm Boolean @default(true)
+
+  /// Start times fall on this grid, in minutes.
+  slotMinutes Int @default(30)
+  /// How long a table is held for one party. A 90-minute turn on a 30-minute
+  /// grid occupies three start-slots, which is what stops the same table being
+  /// sold twice on a busy night.
+  turnMinutes Int @default(90)
+  /// SEATS, not tables. Counting tables would let a four-table shop take four
+  /// bookings of eight.
+  seatsPerSlot Int @default(16)
+
+  minPartySize Int @default(1)
+  maxPartySize Int @default(8)
+
+  leadTimeMinutes Int @default(60)
+  advanceDays     Int @default(14)
+
+  /// Shown verbatim on the booking page, e.g. 「訂位保留 15 分鐘」.
+  customerNotice String? @db.VarChar(500)
+
+  updatedById String?   @db.Uuid
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("reservation_settings")
+}
+
+/// Seat counters — one row per merchant per start time, created on first use.
+///
+/// Mirrors `menu_item_daily_stock`: the row is the lock. Booking holds it with
+/// `FOR UPDATE` (via a conditional upsert) so two simultaneous requests cannot
+/// both see the last table. `capacity` is deliberately NOT stored here — it is
+/// read from `ReservationSettings` at booking time, so lowering `seatsPerSlot`
+/// takes effect immediately instead of only for slots nobody has booked yet.
+model ReservationSlot {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String   @db.Uuid
+  /// The slot's start instant, always on the merchant's grid.
+  slotStart  DateTime @db.Timestamptz(3)
+
+  /// Seats committed to bookings that still hold them.
+  booked Int @default(0)
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, slotStart])
+  @@map("reservation_slots")
+}
+
+model Reservation {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reservationNo String @unique @db.VarChar(24)
+
+  merchantId String @db.Uuid
+  customerId String @db.Uuid
+
+  status ReservationStatus @default(PENDING)
+
+  partySize Int
+
+  /// The booked instant. Always on the merchant's slot grid.
+  startsAt DateTime @db.Timestamptz(3)
+  /// Copied from settings at booking time, NOT read live on release.
+  ///
+  /// If the shop shortens its turn time, the bookings already in the book must
+  /// still give back exactly the seats they took. Reading the current setting at
+  /// release time would leave the difference stranded in `reservation_slots`
+  /// forever, and the book would slowly look fuller than it is.
+  turnMinutes Int
+  /// Merchant-local date of `startsAt` — drives the board's day view.
+  serviceDate DateTime @db.Date
+
+  customerName String  @db.VarChar(80)
+  contactPhone String  @db.VarChar(32)
+  customerNote String? @db.Text
+  /// The shop's reply, shown verbatim to the customer.
+  merchantNote String? @db.Text
+  /// Why the shop refused, or why either side called it off.
+  statusReason String? @db.VarChar(300)
+
+  /// Who moved it last. Reuses the order's actor enum — the four values are the
+  /// same four parties, and a second identical enum would be one more thing to
+  /// keep in step.
+  lastActor   OrderActorType?
+  lastActorId String?        @db.Uuid
+
+  /// Bumped on every transition. Doubles as the outbox event version, so a
+  /// consumer can still detect an out-of-order delivery.
+  version Int @default(1)
+
+  confirmedAt DateTime? @db.Timestamptz(3)
+  seatedAt    DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  cancelledAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customer User     @relation("CustomerReservations", fields: [customerId], references: [id])
+
+  /// The board reads "today, still live" on every poll.
+  @@index([merchantId, serviceDate, status])
+  @@index([merchantId, startsAt])
+  @@index([customerId, startsAt(sort: Desc)])
+  @@map("reservations")
+}
+
+// ============================================================================
+//  Merchant closures — dated exceptions to the weekly hours pattern
+// ============================================================================
+
+/// One calendar date on which the shop does not trade at all.
+///
+/// `serviceDate` is a **merchant-local date**, stored as `@db.Date`, not an
+/// instant — a closure is a statement about a trading day, and turning it into
+/// a timestamp would immediately raise "midnight in whose timezone".
+///
+/// A closure also **cancels the reservations booked into that day**. That is a
+/// deliberate, destructive choice requested by the owner: the alternative
+/// (leave them and hope the shop notices) strands customers at a locked door.
+/// The cancellation goes through `ReservationStateMachine`, so it is recorded,
+/// emits its outbox event, and is reversible by re-booking.
+model MerchantClosure {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+
+  /// The merchant-local trading day being closed.
+  serviceDate DateTime @db.Date
+
+  reason     ClosureReason @default(OTHER)
+  /// Shown to the customer on the booking page and in the cancellation notice.
+  note       String?       @db.VarChar(300)
+
+  /// Set the first time this closure runs its cancellation sweep, so the sweep
+  /// is idempotent — a shop that saves the same closure twice must not cancel
+  /// the same booking twice.
+  cancelledReservationsAt DateTime? @db.Timestamptz(3)
+  /// How many bookings the sweep cancelled. Kept for the confirmation banner.
+  cancelledReservationCount Int @default(0)
+
+  createdById String? @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, serviceDate])
+  @@index([merchantId, serviceDate])
+  @@map("merchant_closures")
+}
+
+// ============================================================================
+//  Walk-in waitlist — the queue, which has no lead time
+// ============================================================================
+
+model WaitlistSettings {
+  merchantId String @id @db.Uuid
+
+  /// `false` hides the "take a number" entry point entirely.
+  enabled        Boolean @default(false)
+  /// Take tickets even while the shop is shut, so the queue is warm at opening.
+  acceptWhenClosed Boolean @default(false)
+
+  minPartySize Int @default(1)
+  maxPartySize Int @default(10)
+
+  /// Estimated minutes per party, used for the "roughly N minutes" quote. It is
+  /// an estimate and labelled as one: the shop is not held to it.
+  averageTurnMinutes Int @default(45)
+
+  /// How long a called party has to appear before the ticket is a no-show.
+  callTimeoutMinutes Int @default(10)
+
+  /// Verbatim on the take-a-number page.
+  customerNotice String? @db.VarChar(500)
+
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@map("waitlist_settings")
+}
+
+model WaitlistEntry {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+
+  /// Short human-facing ticket, e.g. `A-014`. Unique per merchant per day.
+  ticketNo String @db.VarChar(16)
+  /// Merchant-local trading day the ticket belongs to.
+  serviceDate DateTime @db.Date
+
+  status     WaitlistStatus @default(WAITING)
+  partySize  Int
+  guestName  String         @db.VarChar(80)
+  contactPhone String       @db.VarChar(32)
+  note       String?        @db.Text
+
+  /// POSITION IS NOT STORED. The queue order is `joinedAt` within
+  /// `(merchantId, serviceDate)`, and the number shown to the guest is computed
+  /// on read. A stored position would have to be renumbered on every cancel,
+  /// and the renumbering is exactly the write that races with a second host.
+  joinedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  /// Snapshot of the estimate at join time, so the page can show "you were told
+  /// 30 minutes" rather than silently moving the goalposts.
+  quotedMinutes Int?
+
+  calledAt    DateTime? @db.Timestamptz(3)
+  seatedAt    DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  cancelledAt DateTime? @db.Timestamptz(3)
+  /// Why it ended, when not by being seated.
+  statusReason String?  @db.VarChar(300)
+
+  /// Bumped on every transition; doubles as the outbox event version.
+  version Int @default(1)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, serviceDate, ticketNo])
+  /// The host board reads "this shop, today, still waiting" on every poll.
+  @@index([merchantId, serviceDate, status, joinedAt])
+  @@map("waitlist_entries")
+}
+
+// ============================================================================
+//  In-store dining — scan a QR, order at the table
+// ============================================================================
+
+model DiningTable {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+
+  /// What is printed on the QR, e.g. `A12`. Unique per shop.
+  code    String  @db.VarChar(32)
+  label   String? @db.VarChar(80)
+  seats   Int     @default(4)
+  isActive Boolean @default(true)
+
+  /// Opaque, rotatable token embedded in the QR URL. Rotating it invalidates
+  /// every printed code for this table at once, which is the only lever a shop
+  /// has when a code leaks onto the internet.
+  qrToken String @unique @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  sessions DiningSession[]
+
+  @@unique([merchantId, code])
+  @@index([merchantId, isActive])
+  @@map("dining_tables")
+}
+
+/// One sitting at one table.
+///
+/// Deliberately a **separate aggregate from `Order`**, not a new `OrderStatus`.
+/// The order lifecycle is a fulfilment pipeline (`PAID → ACCEPTED → PREPARING →
+/// READY_FOR_PICKUP → COMPLETED`) whose tail is about *collection*; a dine-in
+/// guest never collects anything. Bolting a `DINING_*` branch onto that enum
+/// would make every `READY_FOR_PICKUP`-shaped guard wrong for half its states.
+///
+/// What the two share is the money and the kitchen. An in-store order is still
+/// an `Order` row with `fulfilmentMode`/`paymentMode` set so the kitchen board
+/// and the pricing engine work unchanged; the session is what groups the
+/// several orders a table places across one sitting and gates the QR token.
+model DiningSession {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  merchantId String @db.Uuid
+  tableId    String @db.Uuid
+
+  status DiningSessionStatus @default(OPEN)
+
+  /// The party, for the kitchen ticket header ("Table A12 · 4 pax").
+  partySize Int?
+
+  /// Merchant-local trading day — the same key the reservation book uses.
+  serviceDate DateTime @db.Date
+
+  openedAt DateTime  @default(now()) @db.Timestamptz(3)
+  closedAt DateTime? @db.Timestamptz(3)
+  closedById String? @db.Uuid
+
+  /// Bumped on every change so the table view can poll cheaply.
+  version Int @default(1)
+
+  /// 一次性入座碼 — the token the guest's ordering session is keyed on.
+  ///
+  /// Minted when the sitting opens and NEVER reused: a guest photographs the
+  /// table's printed QR once, and that static code only ever opens a sitting —
+  /// it never carries ordering authority. Ordering authority is this per-sitting
+  /// token, so a stale photo of the table code one table away cannot add a round
+  /// to somebody else's bill. Rotating it (on close, or on demand) ends the
+  /// guest's ability to order without touching the printed label.
+  guestToken String? @unique @db.VarChar(64)
+
+  /// The guest identity the sitting's orders are attributed to.
+  ///
+  /// A dine-in guest has no account, but `orders.customerId` is a NOT NULL FK
+  /// to `users` — so the first round at a table provisions one lightweight
+  /// `CUSTOMER` row per sitting (empty phone, `displayName` = the table code).
+  /// It exists to satisfy the ledger and the audit trail, never to be logged
+  /// into: no phone, no email, no refresh token.
+  guestCustomerId String? @db.Uuid
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  merchant Merchant     @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  table    DiningTable  @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  guest    User?        @relation("DiningSessionGuest", fields: [guestCustomerId], references: [id], onDelete: SetNull)
+  orders   Order[]
+
+  /// A table can only have one open sitting at a time. Enforced here rather
+  /// than in code because "two open sittings on one table" is silent data
+  /// corruption, not a race the service layer should be trusted to prevent.
+  @@index([merchantId, status])
+  @@index([tableId, status])
+  @@index([merchantId, serviceDate])
+  @@map("dining_sessions")
+}
+
+// ============================================================================
+//  Refund requests — a ticket, never a payment
+// ============================================================================
+
+/// A customer's request for money back, and the shop's answer.
+///
+/// **This table is deliberately not connected to `payments`.** The platform
+/// never moves money here: the shop and the customer settle between themselves
+/// (cash at the counter, a bank transfer, store credit) and the platform only
+/// keeps a record that the conversation happened and how it ended.
+///
+/// The consequence worth stating out loud: `RESOLVED_OFFLINE` is the shop's
+/// *claim*, and nothing verifies it. An admin can read it; nobody reconciles it.
+/// That is the trade the owner chose, and it must stay visible in the UI wording
+/// ("店家表示已退款") rather than being rendered as a fact.
+model RefundRequest {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId String @db.Uuid
+  merchantId String @db.Uuid
+  customerId String @db.Uuid
+
+  status RefundRequestStatus @default(OPEN)
+  reasonCode RefundReasonCode
+
+  /// Amount the customer is asking for, in minor units. Advisory only — the
+  /// shop decides what it actually hands over.
+  requestedAmountMinor Int?
+  /// Denormalised so the shop sees what is at stake without a join.
+  orderTotalMinor Int
+
+  customerNote String? @db.Text
+  /// The shop's reply, shown verbatim to the customer.
+  merchantNote String? @db.Text
+
+  /// What the shop says it handed back, and any reference the customer can
+  /// quote. Still only a claim.
+  settledAmountMinor Int?
+  settlementReference String? @db.VarChar(120)
+
+  resolvedById String?   @db.Uuid
+  resolvedAt   DateTime? @db.Timestamptz(3)
+  cancelledAt  DateTime? @db.Timestamptz(3)
+
+  version Int @default(1)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  merchant Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customer User     @relation("CustomerRefundRequests", fields: [customerId], references: [id])
+
+  /// One open request per order. A second one after resolution is allowed.
+  @@index([orderId, status])
+  @@index([merchantId, status, createdAt(sort: Desc)])
+  @@index([customerId, createdAt(sort: Desc)])
+  @@map("refund_requests")
+}
